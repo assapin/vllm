@@ -74,6 +74,15 @@ class BatchedScheduler(Scheduler):
         super().__init__(vllm_config, *args, **kwargs)
         self._batch_start: float | None = None
 
+        if vllm_config and vllm_config.scheduler_config.enable_chunked_prefill:
+            raise ValueError(
+                "BatchedScheduler requires chunked prefill to be disabled. "
+                "With chunked prefill enabled, partially-scheduled requests "
+                "move to 'running' and bypass the batch accumulation gate, "
+                "producing unbatched single-request steps. "
+                "Set enable_chunked_prefill=False (pass --no-enable-chunked-prefill)."
+            )
+
         # 1. Read from additional_config (set via --additional-config CLI arg).
         #    This is the canonical path when using standard `vllm serve`.
         extra = (vllm_config.additional_config or {}) if vllm_config else {}
@@ -167,9 +176,10 @@ class BatchedScheduler(Scheduler):
             return super().schedule()
 
         # Waiting-only: apply the accumulation gate.
-        now = time.monotonic()
+        # Use wall-clock time to match req.arrival_time (also time.time()).
+        now = time.time()
         if self._batch_start is None:
-            self._batch_start = now
+            self._batch_start = min(r.arrival_time for r in self.waiting)
 
         elapsed_ms = (now - self._batch_start) * 1000
         waiting_tokens = sum(r.num_prompt_tokens for r in self.waiting)
@@ -183,9 +193,16 @@ class BatchedScheduler(Scheduler):
         )
 
         if time_gate_open or token_gate_open:
-            self._batch_start = None  # reset for the next batch window
             self._emit_metrics(elapsed_ms, waiting_tokens)
-            return super().schedule()
+            result = super().schedule()
+            # If super() left requests in waiting (e.g. capped by max_num_seqs),
+            # reset the window to the oldest remaining request's arrival time so
+            # it doesn't get a free full window.
+            self._batch_start = (
+                min(r.arrival_time for r in self.waiting)
+                if self.waiting else None
+            )
+            return result
 
         # Gate not yet met — return an empty output.  The engine will sleep
         # 1 ms before calling schedule() again (existing code path).

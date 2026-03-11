@@ -225,7 +225,7 @@ New plan: `BatchedScheduler` via `scheduler_cls` + `additional_config` injection
 ## Gotchas
 
 1. **Empty `SchedulerOutput` is explicitly safe**: existing code path, no GPU work, no crash.
-2. **`_batch_start` timer resets to `None` after firing**, NOT on each call.
+2. **`_batch_start` uses `time.time()` (wall clock) to match `req.arrival_time`**. It is initialised to the oldest waiting request's `arrival_time`, not `time.now()`. After firing, it resets to the oldest *remaining* request's `arrival_time` (if `super().schedule()` left requests in the queue, e.g. due to `max_num_seqs`), or `None` if the queue is empty. This ensures leftover requests don't get a free extra window.
 3. **Config via `additional_config`**: read in `__init__` from `vllm_config.additional_config`. Env vars are the subprocess inheritance mechanism and are checked as fallback.
 4. **`max_wait_ms=0, min_batch_tokens=0`** is a transparent passthrough — behaves identically to the base `Scheduler`.
 
@@ -362,6 +362,61 @@ at that point — no extra work required.
 - Histograms are only registered when `BatchedScheduler` is imported
 - The `/metrics` endpoint is served automatically by `serve_http()` via
   vLLM's existing Prometheus middleware
+
+---
+
+## Configuration Guide: Tuning for Predictable SLA
+
+The three knobs together define a utilization-vs-latency band:
+
+| Knob | Type | Ensures |
+|------|------|---------|
+| `batch_min_tokens` | soft lower bound | GPU utilization — don't fire tiny batches |
+| `--max-num-batched-tokens` | hard upper bound | SLA — GPU prefill time per batch is bounded |
+| `batch_max_queue_delay_ms` | time escape hatch | No request starves when load is too low to hit `batch_min_tokens` |
+
+Together: **"fire a batch of `batch_min_tokens`–`max_num_batched_tokens` tokens, and no request waits more than `batch_max_queue_delay_ms`."**
+
+### Latency decomposition
+
+```
+total_request_latency = queue_wait + P(batch_tokens) + decode_time
+                        ↑                ↑                  ↑
+                 ≤ batch_max_        ≤ P(max_num_       not controlled
+                 queue_delay_ms      batched_tokens)    by BatchedScheduler
+```
+
+`P(tokens)` is the **prefill time** — the GPU wall-clock time to run the forward pass for a batch of `tokens` total prompt tokens. This is what `BatchedScheduler` gates. It is model- and hardware-specific (a 70B model on one A100 has a very different `P(tokens)` curve than a 7B on H100).
+
+The SLA constraint for the parts `BatchedScheduler` controls:
+
+```
+batch_max_queue_delay_ms + P(max_num_batched_tokens) ≤ SLA
+```
+
+`batch_min_tokens` is a *soft* lower bound — the time gate overrides it when load is low, so you may occasionally fire a small batch rather than let a request wait indefinitely.
+
+`--max-num-batched-tokens` is a *hard* upper bound enforced by the base scheduler — no batch will ever exceed it regardless of queue depth.
+
+### Calibration recipe
+
+1. **Benchmark prefill** on your hardware: measure `P(tokens)` at several batch sizes (e.g. 256, 512, 1024, 2048, 4096 tokens).
+2. **Set `max-num-batched-tokens`**: largest token count where `P(tokens) ≤ SLA - acceptable_queue_wait`. Example: if SLA=200ms, acceptable queue wait=100ms, and `P(2048)=95ms` → `max-num-batched-tokens=2048`.
+3. **Set `batch_min_tokens`**: minimum token count where GPU utilization is acceptable — typically 25–50% of `max-num-batched-tokens`.
+4. **Set `batch_max_queue_delay_ms`**: `SLA - P(max_num_batched_tokens)`. This is the maximum time a request can spend in the queue before the GPU even starts.
+
+### Example
+
+```yaml
+# SLA = 200ms, P(2000 tokens) ≈ 80ms on this hardware
+batch_max_queue_delay_ms: 100   # 200ms SLA - 80ms GPU - 20ms headroom
+batch_min_tokens: 500           # ~25% of max; fire early only if queue fills fast
+max-num-batched-tokens: 2000    # P(2000) fits within SLA budget
+```
+
+### Why chunked prefill must be disabled
+
+With chunked prefill enabled, a request whose tokens don't fully fit in the current batch gets partially scheduled and moves to `running`. Its remaining tokens then bypass the `BatchedScheduler` gate entirely, firing alone in the very next step — a batch of 1, which defeats the purpose. **Always run with `--no-enable-chunked-prefill`** (or `enable_chunked_prefill: false` in YAML). `BatchedScheduler.__init__` raises `ValueError` if chunked prefill is detected.
 
 ---
 
