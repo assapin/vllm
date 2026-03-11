@@ -504,6 +504,8 @@ class FlexibleArgumentParser(ArgumentParser):
             if isinstance(value, bool):
                 if value:
                     processed_args.append("--" + key)
+                else:
+                    processed_args.append("--no-" + key)
             elif isinstance(value, list):
                 if value:
                     processed_args.append("--" + key)
