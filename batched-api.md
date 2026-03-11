@@ -230,6 +230,34 @@ pytest tests/v1/core/test_batched_scheduler.py -x -v
 | `test_default_passthrough` | `max_wait_ms=0, min_batch_tokens=0` fires immediately |
 | `test_scheduler_cls_injection_end_to_end` | Full `EngineArgs.scheduler_cls` injection path |
 
+### Test Infrastructure Notes
+
+**Process isolation:** Each test uses `@create_new_process_for_each_test()` (same pattern as `tests/v1/engine/test_engine_core.py`). This forks a subprocess per test, giving full CUDA memory isolation without manual cleanup — critical since each test loads the model and pre-allocates KV cache.
+
+**`enable_chunked_prefill=False`:** The test engine disables chunked prefill. With chunked prefill enabled, the v1 engine also enables *asynchronous scheduling* (step N launches GPU work for step N-1's schedule), which adds extra pipeline stages and breaks the simple `step() → _drain()` pattern used in these tests.
+
+**v1 async pipeline and the `_drain()` pattern:** With async scheduling enabled (the default for single-GPU eager), `step_with_batch_queue` tries to keep the pipeline full. After scheduling and submitting a real batch to the GPU, it checks `not future.done()` to decide whether to return early (`None, True`) and let the next step collect the result. This introduces an N+1 delay in the steady case. However, the check is a **race**: with a small model (e.g. opt-125m) on a fast GPU, the async output thread sometimes completes the D2H copy before the `done()` check runs, causing outputs to be returned in the *same* step that fired the batch rather than the next.
+
+Tests that do `engine.step()` (fire) then `_drain()` (collect) are flaky against this race: when outputs come back from the fire step, they are discarded, and `_drain` returns empty. The fix is to use `_drain()` for both firing and collecting:
+
+```python
+# WRONG — flaky if GPU finishes before done() check:
+engine.step()            # fires gate (sometimes also returns outputs — discarded!)
+outputs = _drain(engine) # sometimes gets nothing
+
+# CORRECT — _drain's first step fires the gate; subsequent steps collect:
+outputs = _drain(engine) # works regardless of whether pipeline delays output
+```
+
+`_drain()` calls `engine.step()` in a loop and returns on the first non-empty result. If the gate fires and outputs arrive immediately (fast GPU), `_drain` returns from iteration 0. If outputs are pipelined to the next step, `_drain` catches them in iteration 1. Either way the test is correct.
+
+**Timer ordering:** `BatchedScheduler._batch_start` is set on the *first* `schedule()` call, not when the request is added. Tests that sleep to trigger the time gate must call `step()` first (to start the timer and assert gate-is-closed), then sleep, then `_drain()` to fire and collect:
+```python
+engine.step()       # starts _batch_start; asserts gate is closed
+time.sleep(0.060)
+outputs = _drain(engine)  # fires (elapsed >= max_wait_ms) and collects
+```
+
 ---
 
 ## Manual Smoke Test

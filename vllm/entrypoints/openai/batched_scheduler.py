@@ -9,11 +9,24 @@ Usage::
     from vllm.entrypoints.openai.batched_scheduler import BatchedScheduler
 
     # Set class-level config BEFORE creating AsyncLLM / LLMEngine
-    BatchedScheduler.max_wait_ms = 100.0
-    BatchedScheduler.min_batch_tokens = 0
+    BatchedScheduler.max_wait_ms = 100.0   # 0 = disabled (token gate only)
+    BatchedScheduler.min_batch_tokens = 0  # 0 = disabled (time gate only)
 
     engine_args = AsyncEngineArgs(model=..., scheduler_cls=BatchedScheduler)
     async_llm = AsyncLLM.from_engine_args(engine_args)
+
+Gate semantics
+--------------
+- ``max_wait_ms > 0``  : fire when the accumulation window expires.
+- ``max_wait_ms = 0``  : time gate disabled; only token gate applies.
+- ``min_batch_tokens > 0`` : fire when waiting-request token sum reaches
+  this value.
+- ``min_batch_tokens = 0`` : token gate disabled; only time gate applies.
+- Both zero              : no gate — behaves identically to base Scheduler
+  (fires every step).
+
+Either active condition triggers the batch.  Running (decode) requests always
+proceed without delay.
 """
 
 import time
@@ -25,13 +38,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 class BatchedScheduler(Scheduler):
     """Scheduler that defers prefill until a batch threshold is met.
 
-    Two thresholds (both class-level, set before engine creation):
-    - ``max_wait_ms``: fire when the accumulation window expires.
-    - ``min_batch_tokens``: fire when waiting-request token sum reaches
-      this value.  Set to 0 to disable.
-
-    Either condition triggers the batch.  Running (decode) requests always
-    proceed without delay.
+    See module docstring for gate semantics.
     """
 
     # Class-level config — set BEFORE creating the engine.
@@ -41,6 +48,18 @@ class BatchedScheduler(Scheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._batch_start: float | None = None
+        # When the EngineCore subprocess is started via multiprocessing spawn,
+        # it re-imports this module and loses any class-level mutations made in
+        # the parent process.  Read instance-level overrides from env vars,
+        # which ARE inherited by spawned children.  Env vars take precedence
+        # over the class-level defaults.
+        import os
+        max_wait_env = os.environ.get("VLLM_BATCHED_MAX_WAIT_MS")
+        if max_wait_env is not None:
+            self.max_wait_ms = float(max_wait_env)
+        min_tokens_env = os.environ.get("VLLM_BATCHED_MIN_BATCH_TOKENS")
+        if min_tokens_env is not None:
+            self.min_batch_tokens = int(min_tokens_env)
 
     # ------------------------------------------------------------------
     # has_requests(): keep the engine spinning (not blocking) while we
@@ -64,6 +83,10 @@ class BatchedScheduler(Scheduler):
         if self.running or not self.waiting:
             return super().schedule()
 
+        # Both gates disabled → passthrough (behaves like base Scheduler).
+        if self.max_wait_ms <= 0 and self.min_batch_tokens <= 0:
+            return super().schedule()
+
         # Waiting-only: apply the accumulation gate.
         now = time.monotonic()
         if self._batch_start is None:
@@ -72,9 +95,12 @@ class BatchedScheduler(Scheduler):
         elapsed_ms = (now - self._batch_start) * 1000
         waiting_tokens = sum(r.num_prompt_tokens for r in self.waiting)
 
-        time_gate_open = elapsed_ms >= self.max_wait_ms
+        time_gate_open = (
+            self.max_wait_ms > 0 and elapsed_ms >= self.max_wait_ms
+        )
         token_gate_open = (
-            self.min_batch_tokens > 0 and waiting_tokens >= self.min_batch_tokens
+            self.min_batch_tokens > 0
+            and waiting_tokens >= self.min_batch_tokens
         )
 
         if time_gate_open or token_gate_open:

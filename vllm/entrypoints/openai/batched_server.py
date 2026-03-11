@@ -63,7 +63,16 @@ def make_batched_arg_parser() -> FlexibleArgumentParser:
 
 async def run_server(args, **uvicorn_kwargs) -> None:
     """Run the batched inference server."""
-    # Inject BatchedScheduler BEFORE engine construction.
+    import os
+
+    # Set env vars BEFORE the EngineCore subprocess is spawned so they are
+    # inherited by the child process even when multiprocessing spawn is used.
+    # BatchedScheduler.__init__ reads these env vars to set instance-level
+    # attributes, overriding the class-level defaults.
+    os.environ["VLLM_BATCHED_MAX_WAIT_MS"] = str(args.max_wait_ms)
+    os.environ["VLLM_BATCHED_MIN_BATCH_TOKENS"] = str(args.min_batch_tokens)
+
+    # Also set class-level for any in-process / fork-based instantiation.
     BatchedScheduler.max_wait_ms = args.max_wait_ms
     BatchedScheduler.min_batch_tokens = args.min_batch_tokens
     args.scheduler_cls = BatchedScheduler
