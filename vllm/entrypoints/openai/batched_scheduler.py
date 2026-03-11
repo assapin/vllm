@@ -78,9 +78,9 @@ class BatchedScheduler(Scheduler):
         #    This is the canonical path when using standard `vllm serve`.
         extra = (vllm_config.additional_config or {}) if vllm_config else {}
         self.max_wait_ms = float(
-            extra.get("max_wait_ms", type(self).max_wait_ms))
+            extra.get("batch_max_queue_delay_ms", type(self).max_wait_ms))
         self.min_batch_tokens = int(
-            extra.get("min_batch_tokens", type(self).min_batch_tokens))
+            extra.get("batch_min_tokens", type(self).min_batch_tokens))
 
         # 2. Env vars override additional_config — they are the subprocess
         #    inheritance mechanism when EngineCore is spawned.  batched_server

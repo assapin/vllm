@@ -8,7 +8,7 @@ Add a **`BatchedScheduler`** that accumulates requests up to a time or token bud
 ```bash
 vllm serve --model <model> \
     --scheduler-cls vllm.entrypoints.openai.batched_scheduler.BatchedScheduler \
-    --additional-config '{"max_wait_ms": 100, "min_batch_tokens": 500}'
+    --additional-config '{"batch_max_queue_delay_ms": 100, "batch_min_tokens": 500}'
 ```
 
 **YAML config (`--config batched.yaml`):**
@@ -16,8 +16,8 @@ vllm serve --model <model> \
 model: facebook/opt-125m
 scheduler-cls: vllm.entrypoints.openai.batched_scheduler.BatchedScheduler
 additional-config:
-  max_wait_ms: 100
-  min_batch_tokens: 500
+  batch_max_queue_delay_ms: 100
+  batch_min_tokens: 500
 port: 8001
 enforce-eager: true
 ```
@@ -181,17 +181,17 @@ Pass via standard vLLM CLI — no extra entrypoint needed:
 # Inline JSON
 vllm serve --model <model> \
     --scheduler-cls vllm.entrypoints.openai.batched_scheduler.BatchedScheduler \
-    --additional-config '{"max_wait_ms": 100, "min_batch_tokens": 500}'
+    --additional-config '{"batch_max_queue_delay_ms": 100, "batch_min_tokens": 500}'
 
 # Or via YAML config file (--config batched.yaml)
 # model: <model>
 # scheduler-cls: vllm.entrypoints.openai.batched_scheduler.BatchedScheduler
 # additional-config:
-#   max_wait_ms: 100
-#   min_batch_tokens: 500
+#   batch_max_queue_delay_ms: 100
+#   batch_min_tokens: 500
 ```
 
-`BatchedScheduler.__init__` reads `max_wait_ms` and `min_batch_tokens` from `vllm_config.additional_config`. It also checks env vars `VLLM_BATCHED_MAX_WAIT_MS` / `VLLM_BATCHED_MIN_BATCH_TOKENS` as a fallback (they are inherited by the EngineCore subprocess on spawn).
+`BatchedScheduler.__init__` reads `batch_max_queue_delay_ms` and `batch_min_tokens` from `vllm_config.additional_config`. It also checks env vars `VLLM_BATCHED_MAX_WAIT_MS` / `VLLM_BATCHED_MIN_BATCH_TOKENS` as a fallback (they are inherited by the EngineCore subprocess on spawn).
 
 **Configuration priority:** `additional_config` → env vars → class-level defaults.
 
@@ -297,7 +297,7 @@ outputs = _drain(engine)  # fires (elapsed >= max_wait_ms) and collects
 # Start server with batched scheduler
 vllm serve facebook/opt-125m \
     --scheduler-cls vllm.entrypoints.openai.batched_scheduler.BatchedScheduler \
-    --additional-config '{"max_wait_ms": 200, "min_batch_tokens": 100}' \
+    --additional-config '{"batch_max_queue_delay_ms": 200, "batch_min_tokens": 100}' \
     --port 8001 --enforce-eager
 
 # Fire 10 concurrent requests — all should batch together
