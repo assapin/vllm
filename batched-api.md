@@ -4,11 +4,25 @@
 
 Add a **`BatchedScheduler`** that accumulates requests up to a time or token budget, then fires them all at once through the GPU in a single prefill batch. It plugs into the standard `vllm serve` entry point via `--scheduler-cls` and `--additional-config` — no separate server, no core files modified.
 
+**CLI:**
 ```bash
 vllm serve --model <model> \
     --scheduler-cls vllm.entrypoints.openai.batched_scheduler.BatchedScheduler \
     --additional-config '{"max_wait_ms": 100, "min_batch_tokens": 500}'
 ```
+
+**YAML config (`--config batched.yaml`):**
+```yaml
+model: facebook/opt-125m
+scheduler-cls: vllm.entrypoints.openai.batched_scheduler.BatchedScheduler
+additional-config:
+  max_wait_ms: 100
+  min_batch_tokens: 500
+port: 8001
+enforce-eager: true
+```
+
+The YAML loader serializes nested dicts to JSON automatically, so `additional-config` as a YAML mapping is equivalent to the inline JSON form.
 
 The implementation uses **`AsyncLLM`** (the standard v1 async engine) with `BatchedScheduler` injected via `SchedulerConfig.scheduler_cls` — a first-class vLLM injection point. No core files are modified.
 
@@ -164,9 +178,17 @@ class BatchedScheduler(Scheduler):
 Pass via standard vLLM CLI — no extra entrypoint needed:
 
 ```bash
+# Inline JSON
 vllm serve --model <model> \
     --scheduler-cls vllm.entrypoints.openai.batched_scheduler.BatchedScheduler \
     --additional-config '{"max_wait_ms": 100, "min_batch_tokens": 500}'
+
+# Or via YAML config file (--config batched.yaml)
+# model: <model>
+# scheduler-cls: vllm.entrypoints.openai.batched_scheduler.BatchedScheduler
+# additional-config:
+#   max_wait_ms: 100
+#   min_batch_tokens: 500
 ```
 
 `BatchedScheduler.__init__` reads `max_wait_ms` and `min_batch_tokens` from `vllm_config.additional_config`. It also checks env vars `VLLM_BATCHED_MAX_WAIT_MS` / `VLLM_BATCHED_MIN_BATCH_TOKENS` as a fallback (they are inherited by the EngineCore subprocess on spawn).
