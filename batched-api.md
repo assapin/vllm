@@ -2,9 +2,15 @@
 
 ## Context
 
-Add a standalone OpenAI-compatible FastAPI server (`batched_server.py`) that accumulates requests up to a time or token budget, then fires them all at once through the GPU in a single prefill batch. The user starts the server in this mode *instead of* the normal async server.
+Add a **`BatchedScheduler`** that accumulates requests up to a time or token budget, then fires them all at once through the GPU in a single prefill batch. It plugs into the standard `vllm serve` entry point via `--scheduler-cls` and `--additional-config` — no separate server, no core files modified.
 
-The implementation uses **`AsyncLLM`** (the standard v1 async engine) with a custom **`BatchedScheduler`** injected via `SchedulerConfig.scheduler_cls` — a first-class vLLM injection point. No core files are modified.
+```bash
+vllm serve --model <model> \
+    --scheduler-cls vllm.entrypoints.openai.batched_scheduler.BatchedScheduler \
+    --additional-config '{"max_wait_ms": 100, "min_batch_tokens": 500}'
+```
+
+The implementation uses **`AsyncLLM`** (the standard v1 async engine) with `BatchedScheduler` injected via `SchedulerConfig.scheduler_cls` — a first-class vLLM injection point. No core files are modified.
 
 ---
 
@@ -155,14 +161,17 @@ class BatchedScheduler(Scheduler):
 
 ### Injecting the Scheduler
 
-```python
-# In run_server(), BEFORE creating AsyncLLM:
-BatchedScheduler.max_wait_ms = args.max_wait_ms
-BatchedScheduler.min_batch_tokens = args.min_batch_tokens
-args.scheduler_cls = BatchedScheduler   # flows into VllmConfig.scheduler_config
+Pass via standard vLLM CLI — no extra entrypoint needed:
+
+```bash
+vllm serve --model <model> \
+    --scheduler-cls vllm.entrypoints.openai.batched_scheduler.BatchedScheduler \
+    --additional-config '{"max_wait_ms": 100, "min_batch_tokens": 500}'
 ```
 
-The background process imports `BatchedScheduler` from the module, picking up the class-level values set before the process is spawned.
+`BatchedScheduler.__init__` reads `max_wait_ms` and `min_batch_tokens` from `vllm_config.additional_config`. It also checks env vars `VLLM_BATCHED_MAX_WAIT_MS` / `VLLM_BATCHED_MIN_BATCH_TOKENS` as a fallback (they are inherited by the EngineCore subprocess on spawn).
+
+**Configuration priority:** `additional_config` → env vars → class-level defaults.
 
 ---
 
@@ -172,9 +181,9 @@ The background process imports `BatchedScheduler` from the module, picking up th
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `vllm/entrypoints/openai/batched_scheduler.py` | ~60 | `BatchedScheduler` class |
-| `vllm/entrypoints/openai/batched_server.py` | ~80 | Entry point with `--max-wait-ms`, `--min-batch-tokens` |
+| `vllm/entrypoints/openai/batched_scheduler.py` | ~170 | `BatchedScheduler` class + Prometheus metrics |
 | `tests/v1/core/test_batched_scheduler.py` | ~200 | Unit + integration tests |
+| `tests/v1/entrypoints/openai/test_batched_server.py` | ~100 | End-to-end entrypoint tests |
 
 No existing files modified.
 
@@ -182,10 +191,10 @@ No existing files modified.
 
 Original plan: sync `LLM` + `ThreadPoolExecutor` + `_BatchedEngineClient` shim (~450 lines, 1 file)
 
-New plan: `BatchedScheduler` via `scheduler_cls` injection + thin `batched_server.py` entry point:
-- No shim, no thread pool, no custom HTTP queue logic
+New plan: `BatchedScheduler` via `scheduler_cls` + `additional_config` injection:
+- No shim, no thread pool, no custom HTTP queue logic, no separate entrypoint
+- Standard `vllm serve` — prometheus, watchdog, graceful shutdown all work correctly
 - `AsyncLLM` already implements `EngineClient` fully
-- `serve_http()` gives watchdog + graceful shutdown for free
 - LoRA works out of the box via `AsyncLLM.add_lora()`
 - Streaming also works (clients wait for batch gate, then stream tokens)
 
@@ -195,7 +204,7 @@ New plan: `BatchedScheduler` via `scheduler_cls` injection + thin `batched_serve
 
 1. **Empty `SchedulerOutput` is explicitly safe**: existing code path, no GPU work, no crash.
 2. **`_batch_start` timer resets to `None` after firing**, NOT on each call.
-3. **Class-level config on `BatchedScheduler`**: set BEFORE `AsyncLLM` is created. The background process imports the class from the module, picking up the set values.
+3. **Config via `additional_config`**: read in `__init__` from `vllm_config.additional_config`. Env vars are the subprocess inheritance mechanism and are checked as fallback.
 4. **`max_wait_ms=0, min_batch_tokens=0`** is a transparent passthrough — behaves identically to the base `Scheduler`.
 
 ---
@@ -263,10 +272,11 @@ outputs = _drain(engine)  # fires (elapsed >= max_wait_ms) and collects
 ## Manual Smoke Test
 
 ```bash
-# Start batched server
-python -m vllm.entrypoints.openai.batched_server \
-    --model facebook/opt-125m \
-    --max-wait-ms 200 --min-batch-tokens 100 --port 8001 --enforce-eager
+# Start server with batched scheduler
+vllm serve facebook/opt-125m \
+    --scheduler-cls vllm.entrypoints.openai.batched_scheduler.BatchedScheduler \
+    --additional-config '{"max_wait_ms": 200, "min_batch_tokens": 100}' \
+    --port 8001 --enforce-eager
 
 # Fire 10 concurrent requests — all should batch together
 for i in $(seq 10); do
@@ -275,10 +285,61 @@ for i in $(seq 10); do
     -d '{"messages":[{"role":"user","content":"Say hello"}],"model":"facebook/opt-125m"}' &
 done; wait
 
-# Verify health and models endpoints
-curl http://localhost:8001/health
-curl http://localhost:8001/v1/models
+# Check batch metrics
+curl -s http://localhost:8001/metrics | grep vllm_batched
 ```
+
+---
+
+## Prometheus Metrics
+
+Three histograms are emitted from `BatchedScheduler` when the gate fires, using the standard `prometheus_client` library already present in vLLM.
+
+| Metric | Type | Per | Description |
+|--------|------|-----|-------------|
+| `vllm_batched_batch_delay_ms` | Histogram | batch | ms from first request seen by `schedule()` to gate fire. Buckets derived from `max_wait_ms`. |
+| `vllm_batched_batch_size_requests` | Histogram | batch | Number of requests in each fired batch. Fixed power-of-two buckets. |
+| `vllm_batched_batch_size_tokens` | Histogram | batch | Total prompt tokens in each fired batch. Buckets derived from `min_batch_tokens`. |
+
+### Design Rationale
+
+**Per-request queue wait** is already captured by the built-in `vllm:request_queue_time_seconds` (`queued_ts → scheduled_ts`, monotonic timestamps inside the base `Scheduler`). Since `BatchedScheduler` doesn't override those event-recording paths, the accumulation window delay is included automatically. No duplicate needed.
+
+**`vllm_batched_batch_delay_ms`** is the max-wait across a batch (one point per batch fire). It tells you whether the time gate or token gate fired early, and by how much.
+
+**Bucket ranges reflect the actual config**: for `max_wait_ms=50`, delay buckets span 5 ms–100 ms; for `min_batch_tokens=1000`, token buckets span 100–2000. Resolution stays meaningful relative to the operator's chosen thresholds.
+
+### Implementation
+
+Histograms are lazily registered as class-level attributes on first
+`__init__`, so bucket ranges can be derived from the actual config.
+No changes to any existing vLLM file.
+
+```python
+# _delay_buckets(): fractions of max_wait_ms
+# e.g. max_wait_ms=50 → [5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 75.0, 100.0]
+fractions = [0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0]
+
+# _token_buckets(): fractions of min_batch_tokens (or fixed defaults when 0)
+# e.g. min_batch_tokens=1000 → [100, 250, 500, 750, 1000, 1250, 1500, 2000]
+fractions = [0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
+# batch_size_requests: fixed power-of-two buckets
+buckets = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+```
+
+Metrics are emitted from `_emit_metrics()`, called in `schedule()` on the
+gate-fire branch.  `elapsed_ms` and `waiting_tokens` are already computed
+at that point — no extra work required.
+
+### Non-invasiveness
+
+- No existing vLLM files are modified
+- `prometheus_client` is already a vLLM dependency; import failure is
+  silently tolerated (metrics skipped, scheduler still works)
+- Histograms are only registered when `BatchedScheduler` is imported
+- The `/metrics` endpoint is served automatically by `serve_http()` via
+  vLLM's existing Prometheus middleware
 
 ---
 
